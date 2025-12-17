@@ -1,5 +1,9 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pymongo
 pandas
 numpy
+requests
+beautifulsoup4
+lxml
+python-dotenv
