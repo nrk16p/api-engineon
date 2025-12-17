@@ -2,6 +2,7 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from datetime import datetime
 from pymongo import MongoClient
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.schemas import EngineOnRunRequest, EngineOnRunResponse
 from app.config import MONGO_URI, DB_TERMINUS, DB_ATMS, DB_ANALYTICS
@@ -22,7 +23,14 @@ app = FastAPI(
     title="Engine-On ETL API",
     version="1.1.0"
 )
-
+# ✅ CORS (ALLOW ALL)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # --------------------------------------------------
 # Mongo (job status)
 # --------------------------------------------------
