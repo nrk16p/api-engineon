@@ -2,13 +2,14 @@ from pymongo import MongoClient, ReplaceOne
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import gc
 import warnings
 
 warnings.filterwarnings("ignore")
 
 # ============================================================
-# ⚙️ Vectorized Haversine (meters)
+# ⚙️ Haversine (meters)
+# - Works with scalars or numpy arrays
 # ============================================================
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371000.0
@@ -43,7 +44,7 @@ def _classify_engine_state(v, status):
     return "Parking - Engine On" if v >= 25.0 else "Parking - Engine Off"
 
 
-def _split_latlng(series):
+def _split_latlng(series: pd.Series):
     arr = series.astype(str).str.split(",", n=1, expand=True).to_numpy()
     lat = pd.to_numeric(arr[:, 0], errors="coerce")
     lng = pd.to_numeric(arr[:, 1], errors="coerce")
@@ -51,7 +52,8 @@ def _split_latlng(series):
 
 
 # ============================================================
-# 🚀 Main ETL Function (IMPORT SAFE)
+# 🚀 Main ETL Function (LOW-MEM, import-safe)
+# Keep same name for compatibility with app.main import
 # ============================================================
 def process_engineon_data_optimized(
     mongo_uri: str,
@@ -63,17 +65,27 @@ def process_engineon_data_optimized(
     max_distance: int = 200,
     save_raw: bool = True,
     save_summary: bool = True,
-    parallel_dates: bool = False,
-    max_workers: int = 1,
+    parallel_dates: bool = False,   # kept for API compatibility (ignored / not recommended)
+    max_workers: int = 1,           # kept for API compatibility (ignored / not recommended)
     debug_vehicle: str | None = None,
+    mongo_batch_size: int = 1000,   # ✅ cursor batch_size
+    write_batch_size: int = 1000,   # ✅ bulk_write flush threshold
 ):
+    """
+    Low-memory implementation:
+    - stream Mongo cursor per day (no list())
+    - process per plate buffer
+    - nearest plant via 1-event vs N-plants (no dist_matrix)
+    - flush bulk writes in batches
+    """
+
     client = MongoClient(mongo_uri)
     col_log = client[db_terminus]["driving_log"]
     col_plants = client[db_atms]["plants"]
     col_raw = client[db_analytics]["raw_engineon"]
     col_sum = client[db_analytics]["summary_engineon"]
 
-    # -------- Plants --------
+    # -------- Plants (safe to load; usually small) --------
     plants = pd.DataFrame(list(col_plants.find({}, {"_id": 0})))
     if plants.empty:
         raise ValueError("❌ No plant data found")
@@ -82,108 +94,132 @@ def process_engineon_data_optimized(
     plants["Longitude"] = pd.to_numeric(plants["Longitude"], errors="coerce")
     plants = plants.dropna(subset=["Latitude", "Longitude"]).reset_index(drop=True)
 
-    p_lat = plants["Latitude"].to_numpy()
-    p_lng = plants["Longitude"].to_numpy()
-    p_code = plants["plant_code"].to_numpy()
+    p_lat = plants["Latitude"].to_numpy(dtype="float64", copy=False)
+    p_lng = plants["Longitude"].to_numpy(dtype="float64", copy=False)
+    p_code = plants["plant_code"].astype(str).to_numpy(copy=False)
+
+    def nearest_plant_code(lat: float, lng: float):
+        # distance vector to plants (N plants only) => low memory
+        d = haversine(lat, lng, p_lat, p_lng)
+        if d.size == 0:
+            return None
+        i = int(np.nanargmin(d))
+        return p_code[i] if float(d[i]) <= max_distance else None
 
     # -------- Dates --------
     d0 = datetime.strptime(start_date, "%d/%m/%Y")
     d1 = datetime.strptime(end_date, "%d/%m/%Y")
-    date_list = [
-        (d0 + timedelta(days=i)).strftime("%d/%m/%Y")
-        for i in range((d1 - d0).days + 1)
-    ]
+    date_list = [(d0 + timedelta(days=i)).strftime("%d/%m/%Y") for i in range((d1 - d0).days + 1)]
 
-    # -------- Worker --------
-    def _process_one_date(target_date: str):
-        logs = list(
-            col_log.find(
-                {"วันที่": target_date},
-                {
-                    "_id": 0,
-                    "ทะเบียนพาหนะ": 1,
-                    "วันที่": 1,
-                    "เวลา": 1,
-                    "Voltage": 1,
-                    "สถานะ": 1,
-                    "สถานที่": 1,
-                    "พิกัด": 1,
-                },
-            )
+    projection = {
+        "_id": 0,
+        "ทะเบียนพาหนะ": 1,
+        "วันที่": 1,
+        "เวลา": 1,
+        "Voltage": 1,
+        "สถานะ": 1,
+        "สถานที่": 1,
+        "พิกัด": 1,
+    }
+
+    raw_ops: list[ReplaceOne] = []
+    sum_ops: list[ReplaceOne] = []
+
+    def flush_writes(force: bool = False):
+        nonlocal raw_ops, sum_ops
+
+        if save_raw and raw_ops and (force or len(raw_ops) >= write_batch_size):
+            col_raw.bulk_write(raw_ops, ordered=False)
+            raw_ops.clear()
+
+        # summary ops usually far less
+        if save_summary and sum_ops and (force or len(sum_ops) >= max(200, write_batch_size // 10)):
+            col_sum.bulk_write(sum_ops, ordered=False)
+            sum_ops.clear()
+
+        gc.collect()
+
+    def process_plate(plate: str, rows: list[dict], target_date: str):
+        if not rows:
+            return
+
+        dfp = pd.DataFrame(rows)
+        dfp = dfp.dropna(subset=["ทะเบียนพาหนะ", "เวลา"]).reset_index(drop=True)
+        if dfp.empty:
+            return
+
+        # voltage type
+        vtype = dfp["Voltage"].apply(_classify_voltage_type)
+        version_type = "v1" if (vtype == "v1").any() else ("v2" if (vtype == "v2").any() else None)
+        if not version_type:
+            return
+
+        # datetime
+        dt = pd.to_datetime(
+            dfp["วันที่"].astype(str) + " " + dfp["เวลา"].astype(str),
+            format="%d/%m/%Y %H:%M:%S",
+            errors="coerce",
         )
+        dfp = dfp.assign(datetime=dt).dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+        if dfp.empty:
+            return
 
-        if not logs:
-            return f"{target_date}: no data"
+        # engine state + diff
+        vnum = pd.to_numeric(dfp["Voltage"], errors="coerce")
+        dfp["engine_state"] = [_classify_engine_state(v, s) for v, s in zip(vnum, dfp["สถานะ"].astype(str))]
 
-        df_day = pd.DataFrame(logs).dropna(subset=["ทะเบียนพาหนะ", "เวลา"])
-        if df_day.empty:
-            return f"{target_date}: empty"
+        dfp["prev_dt"] = dfp["datetime"].shift(1)
+        dfp["prev_state"] = dfp["engine_state"].shift(1)
+        dfp["prev_place"] = dfp["สถานที่"].shift(1)
+        dfp["time_diff"] = (dfp["datetime"] - dfp["prev_dt"]).dt.total_seconds() / 60.0
 
-        raw_ops, sum_ops = [], []
+        dfv = dfp.loc[
+            (dfp["engine_state"] == "Parking - Engine On")
+            & (dfp["prev_state"] == "Parking - Engine On")
+            & (dfp["สถานที่"] == dfp["prev_place"])
+            & (dfp["time_diff"] > 0)
+            & (dfp["time_diff"] <= 5)
+        ].copy()
 
-        for plate, dfp in df_day.groupby("ทะเบียนพาหนะ"):
-            vtype = dfp["Voltage"].apply(_classify_voltage_type)
-            version_type = "v1" if (vtype == "v1").any() else "v2" if (vtype == "v2").any() else None
-            if not version_type:
-                continue
+        if dfv.empty:
+            return
 
-            dt = pd.to_datetime(
-                dfp["วันที่"].astype(str) + " " + dfp["เวลา"].astype(str),
-                format="%d/%m/%Y %H:%M:%S",
-                errors="coerce",
-            )
-            dfp = dfp.assign(datetime=dt).dropna(subset=["datetime"]).sort_values("datetime")
+        lat, lng = _split_latlng(dfv["พิกัด"])
+        dfv["lat"], dfv["lng"] = lat, lng
+        dfv["prev_lat"] = dfv["lat"].shift(1)
+        dfv["prev_lng"] = dfv["lng"].shift(1)
+        dfv["dist"] = haversine(dfv["prev_lat"], dfv["prev_lng"], dfv["lat"], dfv["lng"])
 
-            vnum = pd.to_numeric(dfp["Voltage"], errors="coerce")
-            dfp["engine_state"] = [
-                _classify_engine_state(v, s)
-                for v, s in zip(vnum, dfp["สถานะ"])
-            ]
+        # event split
+        dfv["event_id"] = ((dfv["dist"] > max_distance) | dfv["dist"].isna()).astype(int).cumsum()
 
-            dfp["prev_dt"] = dfp["datetime"].shift()
-            dfp["prev_state"] = dfp["engine_state"].shift()
-            dfp["prev_place"] = dfp["สถานที่"].shift()
-            dfp["time_diff"] = (dfp["datetime"] - dfp["prev_dt"]).dt.total_seconds() / 60
-
-            dfv = dfp[
-                (dfp["engine_state"] == "Parking - Engine On")
-                & (dfp["prev_state"] == "Parking - Engine On")
-                & (dfp["สถานที่"] == dfp["prev_place"])
-                & (dfp["time_diff"] > 0)
-                & (dfp["time_diff"] <= 5)
-            ].copy()
-
-            if dfv.empty:
-                continue
-
-            lat, lng = _split_latlng(dfv["พิกัด"])
-            dfv["lat"], dfv["lng"] = lat, lng
-            dfv["prev_lat"] = dfv["lat"].shift()
-            dfv["prev_lng"] = dfv["lng"].shift()
-            dfv["dist"] = haversine(dfv["prev_lat"], dfv["prev_lng"], dfv["lat"], dfv["lng"])
-            dfv["event_id"] = ((dfv["dist"] > max_distance) | dfv["dist"].isna()).cumsum()
-
-            events = dfv.groupby("event_id").agg(
+        events = (
+            dfv.groupby("event_id", as_index=False)
+            .agg(
                 total_engine_on_min=("time_diff", "sum"),
                 lat=("lat", "mean"),
                 lng=("lng", "mean"),
-            ).reset_index()
-
-            dist_matrix = haversine(
-                events["lat"].to_numpy()[:, None],
-                events["lng"].to_numpy()[:, None],
-                p_lat[None, :],
-                p_lng[None, :],
+                count_records=("time_diff", "count"),
             )
+        )
+        if events.empty:
+            return
 
-            idx = np.nanargmin(dist_matrix, axis=1)
-            min_dist = dist_matrix[np.arange(len(events)), idx]
-            events["nearest_plant"] = np.where(min_dist <= max_distance, p_code[idx], None)
+        # nearest plant (loop, no dist_matrix)
+        nearest = []
+        for r in events.itertuples(index=False):
+            if pd.isna(r.lat) or pd.isna(r.lng):
+                nearest.append(None)
+            else:
+                nearest.append(nearest_plant_code(float(r.lat), float(r.lng)))
+        events["nearest_plant"] = nearest
 
-            date_key = datetime.strptime(target_date, "%d/%m/%Y").strftime("%Y-%m-%d")
+        date_key = datetime.strptime(target_date, "%d/%m/%Y").strftime("%Y-%m-%d")
 
-            for i, r in events.iterrows():
-                _id = f"{plate}_{date_key}_{i}"
+        # raw events
+        if save_raw:
+            for eid, rec in zip(events["event_id"].tolist(), events.to_dict("records")):
+                _id = f"{plate}_{date_key}_{eid}"
                 raw_ops.append(
                     ReplaceOne(
                         {"_id": _id},
@@ -191,43 +227,79 @@ def process_engineon_data_optimized(
                             "_id": _id,
                             "ทะเบียนพาหนะ": plate,
                             "date": target_date,
-                            **r.to_dict(),
+                            "version_type": version_type,
+                            **rec,
                         },
                         upsert=True,
                     )
                 )
 
+        # summary (plant only)
+        if save_summary:
             valid = events[events["nearest_plant"].notna()]
             if not valid.empty:
-                total_min = valid["total_engine_on_min"].sum()
+                total_min = float(valid["total_engine_on_min"].sum())
+                sum_id = f"{plate}_{date_key}"
                 sum_ops.append(
                     ReplaceOne(
-                        {"_id": f"{plate}_{date_key}"},
+                        {"_id": sum_id},
                         {
-                            "_id": f"{plate}_{date_key}",
+                            "_id": sum_id,
                             "ทะเบียนพาหนะ": plate,
                             "date": target_date,
                             "total_engine_on_min": total_min,
-                            "total_engine_on_hr": total_min / 60,
+                            "total_engine_on_hr": total_min / 60.0,
                             "version_type": version_type,
                         },
                         upsert=True,
                     )
                 )
 
-        if save_raw and raw_ops:
-            col_raw.bulk_write(raw_ops, ordered=False)
-        if save_summary and sum_ops:
-            col_sum.bulk_write(sum_ops, ordered=False)
+                if debug_vehicle and plate == debug_vehicle:
+                    print(f"🔍 {plate} {target_date}: plant_total_min={total_min:.2f}")
 
-        return f"{target_date}: raw={len(raw_ops)}, summary={len(sum_ops)}"
+        flush_writes(force=False)
 
-    if parallel_dates:
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            for r in as_completed([ex.submit(_process_one_date, d) for d in date_list]):
-                print(r.result())
-    else:
-        for d in date_list:
-            print(_process_one_date(d))
+        # free memory per plate
+        del dfp, dfv, events
+        gc.collect()
 
-    print("🎉 ETL Completed")
+    # -------- main per date --------
+    for target_date in date_list:
+        # IMPORTANT: sort by plate so we can stream plate-by-plate
+        cursor = (
+            col_log.find({"วันที่": target_date}, projection)
+            .sort("ทะเบียนพาหนะ", 1)
+            .batch_size(mongo_batch_size)
+        )
+
+        current_plate = None
+        buffer: list[dict] = []
+        processed_plates = 0
+
+        for doc in cursor:
+            plate = doc.get("ทะเบียนพาหนะ")
+            if not plate:
+                continue
+
+            if current_plate is None:
+                current_plate = plate
+
+            if plate != current_plate:
+                process_plate(current_plate, buffer, target_date)
+                buffer.clear()
+                current_plate = plate
+                processed_plates += 1
+
+            buffer.append(doc)
+
+        # last plate
+        if buffer and current_plate is not None:
+            process_plate(current_plate, buffer, target_date)
+            processed_plates += 1
+
+        # flush per date
+        flush_writes(force=True)
+        print(f"{target_date}: processed_plates={processed_plates}, raw_ops=0, sum_ops=0")
+
+    print("🎉 ETL Completed (low-mem)")
