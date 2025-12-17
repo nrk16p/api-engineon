@@ -6,4 +6,5 @@ numpy
 requests
 beautifulsoup4
 lxml
+openpyxl
 python-dotenv
