@@ -63,8 +63,8 @@ def process_engineon_data_optimized(
     max_distance: int = 200,
     save_raw: bool = True,
     save_summary: bool = True,
-    parallel_dates: bool = True,
-    max_workers: int = 4,
+    parallel_dates: bool = False,
+    max_workers: int = 1,
     debug_vehicle: str | None = None,
 ):
     client = MongoClient(mongo_uri)
