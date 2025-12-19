@@ -9,7 +9,6 @@ warnings.filterwarnings("ignore")
 
 # ============================================================
 # ⚙️ Haversine (meters)
-# - Works with scalars or numpy arrays
 # ============================================================
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371000.0
@@ -19,7 +18,7 @@ def haversine(lat1, lon1, lat2, lon2):
     lon2 = np.radians(lon2)
     dlat = lat2 - lat1
     dlon = lon2 - lon1
-    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
     return 2.0 * R * np.arcsin(np.sqrt(a))
 
 
@@ -51,9 +50,13 @@ def _split_latlng(series: pd.Series):
     return lat, lng
 
 
+def _mode_first(x: pd.Series):
+    m = x.mode()
+    return m.iloc[0] if not m.empty else x.iloc[0]
+
+
 # ============================================================
-# 🚀 Main ETL Function (LOW-MEM, import-safe)
-# Keep same name for compatibility with app.main import
+# 🚀 Main ETL (LOW-MEM, SAME OUTPUT AS ORIGINAL)
 # ============================================================
 def process_engineon_data_optimized(
     mongo_uri: str,
@@ -65,27 +68,20 @@ def process_engineon_data_optimized(
     max_distance: int = 200,
     save_raw: bool = True,
     save_summary: bool = True,
-    parallel_dates: bool = False,   # kept for API compatibility (ignored / not recommended)
-    max_workers: int = 1,           # kept for API compatibility (ignored / not recommended)
+    parallel_dates: bool = False,   # kept for compatibility
+    max_workers: int = 1,           # kept for compatibility
     debug_vehicle: str | None = None,
-    mongo_batch_size: int = 1000,   # ✅ cursor batch_size
-    write_batch_size: int = 1000,   # ✅ bulk_write flush threshold
+    mongo_batch_size: int = 1000,
+    write_batch_size: int = 1000,
 ):
-    """
-    Low-memory implementation:
-    - stream Mongo cursor per day (no list())
-    - process per plate buffer
-    - nearest plant via 1-event vs N-plants (no dist_matrix)
-    - flush bulk writes in batches
-    """
-
     client = MongoClient(mongo_uri)
+
     col_log = client[db_terminus]["driving_log"]
     col_plants = client[db_atms]["plants"]
     col_raw = client[db_analytics]["raw_engineon"]
     col_sum = client[db_analytics]["summary_engineon"]
 
-    # -------- Plants (safe to load; usually small) --------
+    # -------- Plants --------
     plants = pd.DataFrame(list(col_plants.find({}, {"_id": 0})))
     if plants.empty:
         raise ValueError("❌ No plant data found")
@@ -99,7 +95,6 @@ def process_engineon_data_optimized(
     p_code = plants["plant_code"].astype(str).to_numpy(copy=False)
 
     def nearest_plant_code(lat: float, lng: float):
-        # distance vector to plants (N plants only) => low memory
         d = haversine(lat, lng, p_lat, p_lng)
         if d.size == 0:
             return None
@@ -109,7 +104,10 @@ def process_engineon_data_optimized(
     # -------- Dates --------
     d0 = datetime.strptime(start_date, "%d/%m/%Y")
     d1 = datetime.strptime(end_date, "%d/%m/%Y")
-    date_list = [(d0 + timedelta(days=i)).strftime("%d/%m/%Y") for i in range((d1 - d0).days + 1)]
+    date_list = [
+        (d0 + timedelta(days=i)).strftime("%d/%m/%Y")
+        for i in range((d1 - d0).days + 1)
+    ]
 
     projection = {
         "_id": 0,
@@ -124,17 +122,20 @@ def process_engineon_data_optimized(
 
     raw_ops: list[ReplaceOne] = []
     sum_ops: list[ReplaceOne] = []
+    raw_written = 0
+    sum_written = 0
 
-    def flush_writes(force: bool = False):
-        nonlocal raw_ops, sum_ops
+    def flush_writes(force=False):
+        nonlocal raw_ops, sum_ops, raw_written, sum_written
 
         if save_raw and raw_ops and (force or len(raw_ops) >= write_batch_size):
             col_raw.bulk_write(raw_ops, ordered=False)
+            raw_written += len(raw_ops)
             raw_ops.clear()
 
-        # summary ops usually far less
         if save_summary and sum_ops and (force or len(sum_ops) >= max(200, write_batch_size // 10)):
             col_sum.bulk_write(sum_ops, ordered=False)
+            sum_written += len(sum_ops)
             sum_ops.clear()
 
         gc.collect()
@@ -150,23 +151,30 @@ def process_engineon_data_optimized(
 
         # voltage type
         vtype = dfp["Voltage"].apply(_classify_voltage_type)
-        version_type = "v1" if (vtype == "v1").any() else ("v2" if (vtype == "v2").any() else None)
+        version_type = (
+            "v1" if (vtype == "v1").any()
+            else "v2" if (vtype == "v2").any()
+            else None
+        )
         if not version_type:
             return
 
         # datetime
-        dt = pd.to_datetime(
+        dfp["datetime"] = pd.to_datetime(
             dfp["วันที่"].astype(str) + " " + dfp["เวลา"].astype(str),
             format="%d/%m/%Y %H:%M:%S",
             errors="coerce",
         )
-        dfp = dfp.assign(datetime=dt).dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+        dfp = dfp.dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
         if dfp.empty:
             return
 
-        # engine state + diff
+        # engine state
         vnum = pd.to_numeric(dfp["Voltage"], errors="coerce")
-        dfp["engine_state"] = [_classify_engine_state(v, s) for v, s in zip(vnum, dfp["สถานะ"].astype(str))]
+        dfp["engine_state"] = [
+            _classify_engine_state(v, s)
+            for v, s in zip(vnum, dfp["สถานะ"].astype(str))
+        ]
 
         dfp["prev_dt"] = dfp["datetime"].shift(1)
         dfp["prev_state"] = dfp["engine_state"].shift(1)
@@ -184,8 +192,8 @@ def process_engineon_data_optimized(
         if dfv.empty:
             return
 
-        lat, lng = _split_latlng(dfv["พิกัด"])
-        dfv["lat"], dfv["lng"] = lat, lng
+        # lat/lng
+        dfv["lat"], dfv["lng"] = _split_latlng(dfv["พิกัด"])
         dfv["prev_lat"] = dfv["lat"].shift(1)
         dfv["prev_lng"] = dfv["lng"].shift(1)
         dfv["dist"] = haversine(dfv["prev_lat"], dfv["prev_lng"], dfv["lat"], dfv["lng"])
@@ -196,16 +204,22 @@ def process_engineon_data_optimized(
         events = (
             dfv.groupby("event_id", as_index=False)
             .agg(
+                start_time=("prev_dt", "first"),
+                end_time=("datetime", "last"),
                 total_engine_on_min=("time_diff", "sum"),
                 lat=("lat", "mean"),
                 lng=("lng", "mean"),
+                สถานที่=("สถานที่", _mode_first),
                 count_records=("time_diff", "count"),
             )
         )
+
         if events.empty:
             return
 
-        # nearest plant (loop, no dist_matrix)
+        events["total_engine_on_hr"] = events["total_engine_on_min"] / 60.0
+
+        # nearest plant
         nearest = []
         for r in events.itertuples(index=False):
             if pd.isna(r.lat) or pd.isna(r.lng):
@@ -216,10 +230,12 @@ def process_engineon_data_optimized(
 
         date_key = datetime.strptime(target_date, "%d/%m/%Y").strftime("%Y-%m-%d")
 
-        # raw events
+        # -------- RAW --------
         if save_raw:
-            for eid, rec in zip(events["event_id"].tolist(), events.to_dict("records")):
+            for rec in events.to_dict("records"):
+                eid = rec["event_id"]
                 _id = f"{plate}_{date_key}_{eid}"
+
                 raw_ops.append(
                     ReplaceOne(
                         {"_id": _id},
@@ -234,12 +250,13 @@ def process_engineon_data_optimized(
                     )
                 )
 
-        # summary (plant only)
+        # -------- SUMMARY (plant only) --------
         if save_summary:
             valid = events[events["nearest_plant"].notna()]
             if not valid.empty:
                 total_min = float(valid["total_engine_on_min"].sum())
                 sum_id = f"{plate}_{date_key}"
+
                 sum_ops.append(
                     ReplaceOne(
                         {"_id": sum_id},
@@ -258,15 +275,12 @@ def process_engineon_data_optimized(
                 if debug_vehicle and plate == debug_vehicle:
                     print(f"🔍 {plate} {target_date}: plant_total_min={total_min:.2f}")
 
-        flush_writes(force=False)
-
-        # free memory per plate
+        flush_writes(False)
         del dfp, dfv, events
         gc.collect()
 
-    # -------- main per date --------
+    # -------- MAIN LOOP --------
     for target_date in date_list:
-        # IMPORTANT: sort by plate so we can stream plate-by-plate
         cursor = (
             col_log.find({"วันที่": target_date}, projection)
             .sort("ทะเบียนพาหนะ", 1)
@@ -293,13 +307,18 @@ def process_engineon_data_optimized(
 
             buffer.append(doc)
 
-        # last plate
-        if buffer and current_plate is not None:
+        if buffer and current_plate:
             process_plate(current_plate, buffer, target_date)
             processed_plates += 1
 
-        # flush per date
-        flush_writes(force=True)
-        print(f"{target_date}: processed_plates={processed_plates}, raw_ops=0, sum_ops=0")
+        flush_writes(True)
 
-    print("🎉 ETL Completed (low-mem)")
+        print(
+            f"{target_date}: processed_plates={processed_plates}, "
+            f"raw_upserts={raw_written}, sum_upserts={sum_written}"
+        )
+
+        raw_written = 0
+        sum_written = 0
+
+    print("🎉 ETL Completed (low-mem, same output)")
