@@ -63,24 +63,50 @@ def aggregate_driver_cost(df: pd.DataFrame) -> pd.DataFrame:
 def aggregate_engineon(df: pd.DataFrame) -> pd.DataFrame:
     df["date"] = safe_to_datetime(df["date"])
     df["ทะเบียนพาหนะ"] = clean_plate(df["ทะเบียนพาหนะ"])
+
     agg = (
-        df.groupby(["ทะเบียนพาหนะ", "date", "version_type"], as_index=False)
-        ["total_engine_on_min"]
+        df.groupby(
+            ["ทะเบียนพาหนะ", "date", "version_type"],
+            as_index=False
+        )[["total_engine_on_min", "total_engine_on_min_not_plant"]]
         .sum()
     )
+
     agg["Duration_str"] = agg["total_engine_on_min"].apply(to_hms)
+    agg["Duration_str_not_plant"] = agg["total_engine_on_min_not_plant"].apply(to_hms)
+
     return agg
 
 
 def calculate_fuel(df: pd.DataFrame) -> pd.DataFrame:
+    # ---------------------------
+    # 🏭 PLANT (ของเดิม)
+    # ---------------------------
     df["สำรองเวลาโหลด"] = df["#trip"] * 30
     df["ส่วนต่าง"] = df["TotalMinutes"] - df["สำรองเวลาโหลด"]
+    df["ส่วนต่าง"] = df["ส่วนต่าง"].clip(lower=0)
     df["ส่วนต่าง_hhmm"] = df["ส่วนต่าง"].apply(to_hms)
+
     df["จำนวนลิตร"] = (
         df["ประเภทยานพาหนะ"].map(FUEL_RATE).fillna(0)
         * (df["ส่วนต่าง"] / 60)
     )
-    df["จำนวนลิตร"] = df["จำนวนลิตร"].clip(lower=0).round(2)
+    df["จำนวนลิตร"] = df["จำนวนลิตร"].round(2)
+
+    # ---------------------------
+    # 🚚 NOT PLANT (เพิ่มใหม่)
+    # ---------------------------
+    if "total_engine_on_min_not_plant" in df.columns:
+        df["not_plant_minutes"] = df["total_engine_on_min_not_plant"].fillna(0)
+
+        df["not_plant_hhmm"] = df["not_plant_minutes"].apply(to_hms)
+
+        df["not_plant_liter"] = (
+            df["ประเภทยานพาหนะ"].map(FUEL_RATE).fillna(0)
+            * (df["not_plant_minutes"] / 60)
+        )
+        df["not_plant_liter"] = df["not_plant_liter"].round(2)
+
     return df
 
 
