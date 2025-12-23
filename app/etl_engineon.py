@@ -252,9 +252,14 @@ def process_engineon_data_optimized(
 
         # -------- SUMMARY (plant only) --------
         if save_summary:
-            valid = events[events["nearest_plant"].notna()]
-            if not valid.empty:
-                total_min = float(valid["total_engine_on_min"].sum())
+            plant_events = events[events["nearest_plant"].notna()]
+            not_plant_events = events[events["nearest_plant"].isna()]
+
+            plant_min = float(plant_events["total_engine_on_min"].sum()) if not plant_events.empty else 0.0
+            not_plant_min = float(not_plant_events["total_engine_on_min"].sum()) if not not_plant_events.empty else 0.0
+
+            # เขียน summary เมื่อมีอย่างน้อยหนึ่งฝั่ง
+            if plant_min > 0 or not_plant_min > 0:
                 sum_id = f"{plate}_{date_key}"
 
                 sum_ops.append(
@@ -264,8 +269,15 @@ def process_engineon_data_optimized(
                             "_id": sum_id,
                             "ทะเบียนพาหนะ": plate,
                             "date": target_date,
-                            "total_engine_on_min": total_min,
-                            "total_engine_on_hr": total_min / 60.0,
+
+                            # 🏭 ใกล้โรงงาน
+                            "total_engine_on_min": plant_min,
+                            "total_engine_on_hr": plant_min / 60.0,
+
+                            # 🚚 ไม่ใกล้โรงงาน
+                            "total_engine_on_min_not_plant": not_plant_min,
+                            "total_engine_on_hr_not_plant": not_plant_min / 60.0,
+
                             "version_type": version_type,
                         },
                         upsert=True,
@@ -273,7 +285,11 @@ def process_engineon_data_optimized(
                 )
 
                 if debug_vehicle and plate == debug_vehicle:
-                    print(f"🔍 {plate} {target_date}: plant_total_min={total_min:.2f}")
+                    print(
+                        f"🔍 {plate} {target_date} | "
+                        f"plant={plant_min:.2f} min | "
+                        f"not_plant={not_plant_min:.2f} min"
+                    )
 
         flush_writes(False)
         del dfp, dfv, events
